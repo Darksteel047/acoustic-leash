@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Acoustic Leash - Real World GPS</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #050505;
+            color: #f4f4f5;
+            user-select: none;
+            touch-action: none;
+            overflow: hidden;
+            font-family: 'Inter', system-ui, sans-serif;
+        }
+        .status-pill {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        #gps-status.error { color: #ef4444; }
+        #gps-status.success { color: #10b981; }
+        #gps-status.warning { color: #f59e0b; }
+        
+        .ripple {
+            position: absolute;
+            border: 1px solid rgba(59, 130, 246, 0.5);
+            border-radius: 50%;
+            animation: ripple-effect 3s infinite;
+            pointer-events: none;
+        }
+        @keyframes ripple-effect {
+            0% { width: 0; height: 0; opacity: 1; }
+            100% { width: 500px; height: 500px; opacity: 0; }
+        }
+    </style>
+</head>
+<body class="flex flex-col items-center justify-between h-screen p-6 py-12">
+
+    <!-- Top Status Section -->
+    <div class="w-full space-y-4 text-center z-10">
+        <h1 class="text-xl font-light tracking-[0.3em] uppercase opacity-60">Acoustic Leash</h1>
+        <div id="route-indicator" class="status-pill rounded-full py-2 px-4 inline-block">
+            <span class="text-blue-400 text-[10px] font-bold tracking-widest uppercase">H15 → IDC School of Design</span>
+        </div>
+        <div id="gps-status" class="text-[10px] text-zinc-500 font-mono mt-2 uppercase tracking-tighter">Waiting for user input...</div>
+    </div>
+
+    <!-- Center Compass/Visualizer -->
+    <div class="relative w-64 h-64 flex items-center justify-center">
+        <div id="ripple-container" class="absolute inset-0 flex items-center justify-center overflow-hidden rounded-full"></div>
+        <div id="compass" class="absolute inset-0 border border-zinc-800 rounded-full opacity-20"></div>
+        <div class="z-10 w-3 h-3 bg-white rounded-full shadow-[0_0_15px_rgba(255,255,255,0.8)]"></div>
+        <div id="dog-visual" class="absolute w-8 h-8 flex items-center justify-center transition-all duration-300 opacity-0 scale-150">
+            <span class="text-2xl">🐕</span>
+        </div>
+        <div id="tether-line" class="absolute origin-bottom w-[1px] bg-blue-500/30 bottom-1/2 left-1/2 -translate-x-1/2 h-0"></div>
+    </div>
+
+    <!-- Bottom Controls & Navigation -->
+    <div class="w-full max-w-xs space-y-6 z-10">
+        <div id="distance-display" class="text-center">
+            <div class="text-5xl font-extralight tracking-tighter" id="dist-val">--</div>
+            <div class="text-[10px] uppercase tracking-widest opacity-40">meters to target</div>
+        </div>
+
+        <div id="action-area" class="flex flex-col gap-3">
+            <button id="permission-btn" class="w-full py-4 bg-white text-black rounded-2xl font-bold text-sm transition-all active:scale-95">
+                GRANT PERMISSIONS
+            </button>
+            <button id="start-btn" class="hidden w-full py-4 bg-blue-600 text-white rounded-2xl font-bold text-sm shadow-lg shadow-blue-900/20 active:scale-95 animate-pulse">
+                START GUIDANCE
+            </button>
+            <p id="mode-info" class="text-[9px] text-zinc-500 text-center italic"></p>
+        </div>
+
+        <div class="text-[9px] text-center text-zinc-600 uppercase tracking-widest leading-loose">
+            Binaural Audio Wayfinding<br>Follow the sound of the footsteps
+        </div>
+    </div>
+
+<script>
+    /**
+     * GPS PATH DATA: Hostel 15 Entrance to IDC Iconic Building
+     */
+    const PATH = [
+        { lat: 19.136200, lng: 72.915500 }, // H15 Start
+        { lat: 19.135600, lng: 72.915600 }, 
+        { lat: 19.134000, lng: 72.915300 }, 
+        { lat: 19.132500, lng: 72.915400 }, 
+        { lat: 19.131550, lng: 72.915720 }  // IDC End
+    ];
+
+    const STATE = {
+        active: false,
+        isSimulated: false,
+        userLat: 19.136200,
+        userLng: 72.915500,
+        heading: 0,
+        dogAlpha: 1.0,
+        milestones: { p20: false, p50: false, p75: false, done: false },
+        keys: {}
+    };
+
+    let audioCtx, panner, footstepLoop;
+
+    /**
+     * PERMISSION AND INITIALIZATION FLOW
+     */
+    document.getElementById('permission-btn').onclick = async () => {
+        const statusEl = document.getElementById('gps-status');
+        const modeEl = document.getElementById('mode-info');
+        statusEl.innerText = "Initializing Sensors...";
+
+        try {
+            // 1. Initialize Audio Engine (Must happen during user click)
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            panner = audioCtx.createPanner();
+            panner.panningModel = 'HRTF';
+            panner.distanceModel = 'inverse';
+            panner.connect(audioCtx.destination);
+
+            // 2. Request Orientation (iOS Requirement)
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                try {
+                    const response = await DeviceOrientationEvent.requestPermission();
+                    if (response !== 'granted') console.warn("Compass denied.");
+                } catch(e) { console.error("Compass Request Error", e); }
+            }
+
+            // 3. Request Location
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    STATE.userLat = position.coords.latitude;
+                    STATE.userLng = position.coords.longitude;
+                    STATE.isSimulated = false;
+                    startTracking();
+                    statusEl.innerText = "Real GPS Connected";
+                    statusEl.className = "text-[10px] success font-mono mt-2 uppercase tracking-tighter";
+                    modeEl.innerText = "Using Real World GPS";
+                },
+                (err) => {
+                    // FALLBACK TO SIMULATION IF BLOCKED BY BROWSER POLICY
+                    console.warn("GPS Blocked by policy, entering simulation mode for preview.");
+                    STATE.isSimulated = true;
+                    startTracking();
+                    statusEl.innerText = "Simulation Mode (Preview)";
+                    statusEl.className = "text-[10px] warning font-mono mt-2 uppercase tracking-tighter";
+                    modeEl.innerText = "Use Arrow Keys to move in preview. Real GPS will trigger on mobile.";
+                },
+                { enableHighAccuracy: true, timeout: 3000 }
+            );
+
+            // Toggle Buttons
+            document.getElementById('permission-btn').classList.add('hidden');
+            document.getElementById('start-btn').classList.remove('hidden');
+
+        } catch (err) {
+            statusEl.innerText = `Init Error: ${err.message}`;
+            statusEl.className = "text-[10px] error font-mono mt-2 uppercase tracking-tighter";
+        }
+    };
+
+    function startTracking() {
+        // Compass
+        window.addEventListener('deviceorientationabsolute', (e) => {
+            STATE.heading = e.alpha || e.webkitCompassHeading || 0;
+        }, true);
+
+        // Real GPS Tracking (only works if not simulated)
+        if (!STATE.isSimulated) {
+            navigator.geolocation.watchPosition(
+                (pos) => {
+                    STATE.userLat = pos.coords.latitude;
+                    STATE.userLng = pos.coords.longitude;
+                },
+                null,
+                { enableHighAccuracy: true, maximumAge: 0 }
+            );
+        }
+
+        // Keyboard Simulation for Preview
+        window.addEventListener('keydown', (e) => {
+            if (!STATE.isSimulated || !STATE.active) return;
+            const step = 0.00005; // Approx 5 meters per keypress
+            if (e.key === "ArrowUp") STATE.userLat += step;
+            if (e.key === "ArrowDown") STATE.userLat -= step;
+            if (e.key === "ArrowLeft") STATE.userLng -= step;
+            if (e.key === "ArrowRight") STATE.userLng += step;
+            updateNavigation();
+        });
+    }
+
+    /**
+     * AUDIO LOGIC
+     */
+    const playFootstep = () => {
+        if (!STATE.active || !audioCtx) return;
+        
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(105, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(35, audioCtx.currentTime + 0.1);
+        
+        gain.gain.setValueAtTime(0.12, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        
+        osc.connect(gain);
+        gain.connect(panner);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+    };
+
+    const playChime = (freq, vol, duration, double = false) => {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(vol, audioCtx.currentTime + 0.05);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + duration);
+        if (double) setTimeout(() => playChime(freq, vol, duration, false), 300);
+    };
+
+    /**
+     * NAVIGATION MATH
+     */
+    const getDistance = (lat1, lon1, lat2, lon2) => {
+        const R = 6371e3;
+        const dLat = (lat2-lat1) * Math.PI/180;
+        const dLon = (lon2-lon1) * Math.PI/180;
+        const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                  Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
+                  Math.sin(dLon/2) * Math.sin(dLon/2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    };
+
+    const getBearing = (lat1, lon1, lat2, lon2) => {
+        const y = Math.sin((lon2-lon1) * Math.PI/180) * Math.cos(lat2 * Math.PI/180);
+        const x = Math.cos(lat1 * Math.PI/180) * Math.sin(lat2 * Math.PI/180) -
+                  Math.sin(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) * Math.cos((lon2-lon1) * Math.PI/180);
+        return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+    };
+
+    function updateNavigation() {
+        if (!STATE.active) return;
+
+        const dest = PATH[PATH.length - 1];
+        const dist = getDistance(STATE.userLat, STATE.userLng, dest.lat, dest.lng);
+        document.getElementById('dist-val').innerText = Math.round(dist);
+
+        const targetBearing = getBearing(STATE.userLat, STATE.userLng, dest.lat, dest.lng);
+        const relativeBearing = (targetBearing - STATE.heading + 360) % 360;
+        
+        // Update Audio Panner
+        const rad = (relativeBearing - 90) * (Math.PI / 180);
+        panner.setPosition(Math.cos(rad) * 6, 0, Math.sin(rad) * 6);
+
+        // Update UI
+        const dog = document.getElementById('dog-visual');
+        const tether = document.getElementById('tether-line');
+        dog.style.transform = `rotate(${relativeBearing}deg) translateY(-110px) rotate(-${relativeBearing}deg)`;
+        tether.style.transform = `translate(-50%, 0) rotate(${relativeBearing}deg)`;
+        tether.style.height = `110px`;
+
+        // Milestones
+        const total = 550;
+        const prog = 1 - (dist / total);
+        if (prog >= 0.2 && !STATE.milestones.p20) { playChime(440, 0.2, 0.6); STATE.milestones.p20 = true; }
+        if (prog >= 0.5 && !STATE.milestones.p50) { playChime(554, 0.4, 0.6); STATE.milestones.p50 = true; }
+        if (prog >= 0.75 && !STATE.milestones.p75) { playChime(659, 0.3, 0.6, true); STATE.milestones.p75 = true; }
+        if (dist < 10 && !STATE.milestones.done) {
+            playChime(880, 0.5, 2.0, true);
+            STATE.milestones.done = true;
+            document.getElementById('action-area').innerHTML = `<div class="text-green-500 font-bold text-center tracking-widest">IDC REACHED</div>`;
+            if (window.navigator.vibrate) window.navigator.vibrate([200, 100, 200, 100, 500]);
+        }
+    }
+
+    document.getElementById('start-btn').onclick = () => {
+        STATE.active = true;
+        document.getElementById('start-btn').style.display = 'none';
+        document.getElementById('dog-visual').style.opacity = '1';
+        
+        // Visual handoff
+        let start = Date.now();
+        const fader = setInterval(() => {
+            let elapsed = Date.now() - start;
+            STATE.dogAlpha = 1 - (elapsed / 12000);
+            document.getElementById('dog-visual').style.opacity = Math.max(0, STATE.dogAlpha);
+            document.getElementById('tether-line').style.opacity = Math.max(0, STATE.dogAlpha * 0.3);
+            if (STATE.dogAlpha <= 0) clearInterval(fader);
+        }, 100);
+
+        footstepLoop = setInterval(playFootstep, 600);
+        setInterval(updateNavigation, 100);
+        
+        // Ambiance ripples
+        setInterval(() => {
+            if (!STATE.active) return;
+            const r = document.createElement('div');
+            r.className = 'ripple';
+            document.getElementById('ripple-container').appendChild(r);
+            setTimeout(() => r.remove(), 3000);
+        }, 1500);
+    };
+
+</script>
+</body>
+</html>
